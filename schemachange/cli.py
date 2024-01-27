@@ -8,7 +8,7 @@ import sys
 import textwrap
 import time
 import warnings
-from typing import Dict, Any, Optional, Set
+from typing import Dict, Any, Optional, Set, List
 import jinja2
 import jinja2.ext
 import requests
@@ -21,13 +21,15 @@ from pandas import DataFrame
 
 #region Global Variables
 # metadata
+from snowflake.connector.constants import QueryStatus
+
 _schemachange_version = '3.6.1'
 _config_file_name = 'schemachange-config.yml'
 _metadata_database_name = 'METADATA'
 _metadata_schema_name = 'SCHEMACHANGE'
 _metadata_table_name = 'CHANGE_HISTORY'
 _snowflake_application_name = 'schemachange'
-
+_std_output_page_width_default = 80
 # messages
 _err_jinja_env_var = "Could not find environmental variable %s and no default" \
   + " value was provided"
@@ -201,7 +203,8 @@ class SnowflakeSchemachangeSession:
     + "DESCRIPTION VARCHAR, SCRIPT VARCHAR, SCRIPT_TYPE VARCHAR, CHECKSUM VARCHAR," \
     + " EXECUTION_TIME NUMBER, STATUS VARCHAR, INSTALLED_BY VARCHAR, INSTALLED_ON TIMESTAMP_LTZ)"
   _q_ch_r_checksum = "SELECT DISTINCT SCRIPT, FIRST_VALUE(CHECKSUM) OVER (PARTITION BY SCRIPT " \
-    + "ORDER BY INSTALLED_ON DESC) FROM {database_name}.{schema_name}.{table_name} WHERE SCRIPT_TYPE = 'R' AND " \
+    + "ORDER BY " \
+      " DESC) FROM {database_name}.{schema_name}.{table_name} WHERE SCRIPT_TYPE = 'R' AND " \
     + "STATUS = 'Success'"
   _q_ch_fetch ="SELECT VERSION FROM {database_name}.{schema_name}.{table_name} WHERE SCRIPT_TYPE = 'V' ORDER" \
     + " BY INSTALLED_ON DESC LIMIT 1"
@@ -234,7 +237,7 @@ class SnowflakeSchemachangeSession:
     self.autocommit = config['autocommit']
     self.verbose = config['verbose']
     if self.set_connection_args():
-      self.con = snowflake.connector.connect(**self.conArgs)
+      self.con = SnowflakeParallelConnection(**self.conArgs)
       if not self.autocommit:
         self.con.autocommit(False)
     else:
@@ -353,11 +356,70 @@ class SnowflakeSchemachangeSession:
 
     return True
 
+  def execute_parallel_snowflake_queries(self, queries: List[str]):
+    if self.verbose:
+      file_delimiter = "-"*_std_output_page_width_default
+      print(SecretManager.global_redact("Parallel SQL query: %s" % f"\n{file_delimiter}\n".join(queries)))
+    try:
+      query_queues = []
+      for query_str in queries:
+        query_queues.append(self.con.async_execute_string(query_str))
+      concurrency_cnt = len(query_queues)
+      active_queries = [None for _ in range(concurrency_cnt)]
+      query_results = [[] for _ in range(concurrency_cnt)]
+      for i in range(concurrency_cnt):
+        if not active_queries[i]:
+          if query_queues[i]:
+            active_queries[i] = self.con.execute_async_lambda_cursor(query_queues[i][-1])
+          else:
+            continue
+        cur_query_id = active_queries[i]
+        status = self.con.get_query_status(cur_query_id)
+        if status in [
+          QueryStatus.RUNNING,
+          QueryStatus.QUEUED,
+          QueryStatus.QUEUED_REPARING_WAREHOUSE,
+          QueryStatus.BLOCKED,
+          QueryStatus.RESTARTED,
+          QueryStatus.RESUMING_WAREHOUSE
+        ]:
+          # TODO: Add logging at debug level to print status here
+          continue
+        if status != QueryStatus.SUCCESS:
+          # Raise exception query execute would have thrown
+          self.con.cursor().get_query_status_throw_if_error(cur_query_id)
+        else:
+          query_results[i].append(self.con.cursor().query_result(cur_query_id))
+          active_queries[i] = None
+
+
+
+
+
+
+
+
+
+
+      query_id = self.con.cursor().sfqid
+      self.con.cursor().query_result(query_id).
+
+      if not self.autocommit:
+        self.con.commit()
+      return res
+    except Exception as e:
+      if not self.autocommit:
+        self.con.rollback()
+      raise e
+
   def execute_snowflake_query(self, query):
     if self.verbose:
       print(SecretManager.global_redact("SQL query: %s" % query))
     try:
-      res = self.con.execute_string(query)
+      self.con.execute_string(query, _no_results=True)
+      query_id = self.con.cursor().sfqid
+      self.con.cursor().query_result(query_id)
+
       if not self.autocommit:
         self.con.commit()
       return res
@@ -536,7 +598,8 @@ def deploy_command(config):
   # Sort scripts such that versioned scripts get applied first and then the repeatable ones.
   all_script_names_sorted =   sorted_alphanumeric([script for script in all_script_names if script[0] == 'V']) \
                             + sorted_alphanumeric([script for script in all_script_names if script[0] == 'R']) \
-                            + sorted_alphanumeric([script for script in all_script_names if script[0] == 'A'])
+                            + sorted_alphanumeric([script for script in all_script_names if script[0] == 'A']) \
+                            + sorted_alphanumeric([script for script in all_script_names if script[0] == 'P'])
 
   # Loop through each script in order and apply any required changes
   for script_name in all_script_names_sorted:
@@ -701,6 +764,8 @@ def get_all_scripts_recursively(root_directory, verbose):
         file_name.strip(), re.IGNORECASE)
       always_script_name_parts = re.search(r'^([A])__(.+?)\.(?:sql|sql.jinja)$', \
         file_name.strip(), re.IGNORECASE)
+      parallel_scripts_name_parts = re.search(r'^([P])(.+?)__(.+?\).(?:sql|sql.jinja)$', \
+        file_name.strip(), re.IGNORECASE)
 
       # Set script type depending on whether it matches the versioned file naming format
       if script_name_parts is not None:
@@ -715,6 +780,10 @@ def get_all_scripts_recursively(root_directory, verbose):
         script_type = 'A'
         if verbose:
           print("Found Always file " + file_full_path)
+      elif parallel_scripts_name_parts is not None:
+        script_type = 'P'
+        if verbose:
+          print("Found Parallel file " + file_full_path)
       else:
         if verbose:
           print("Ignoring non-change file " + file_full_path)
